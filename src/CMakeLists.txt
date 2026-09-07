@@ -13,6 +13,30 @@ target_link_libraries(mitsuba PUBLIC mitsuba-core)
 target_link_libraries(mitsuba PUBLIC mitsuba-render)
 set_target_properties(mitsuba PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 
+# Scalar CPU bridge to the SFWN representation in the sibling research clone.
+set(SFWN_SOURCE_DIR "${PROJECT_SOURCE_DIR}/../point_cloud_utils/cpp")
+find_package(CGAL REQUIRED)
+find_package(OpenMP REQUIRED)
+target_sources(mitsuba PRIVATE
+  sfwn/sfwn.cpp
+  ${SFWN_SOURCE_DIR}/third_party/miniply.cpp
+)
+target_include_directories(mitsuba PRIVATE
+  ${SFWN_SOURCE_DIR}/include
+  ${SFWN_SOURCE_DIR}/third_party
+)
+target_link_libraries(mitsuba PRIVATE CGAL::CGAL OpenMP::OpenMP_CXX)
+target_compile_definitions(mitsuba PRIVATE MI_BUILD_MODULE=MI_MODULE_LIB)
+set_property(TARGET mitsuba PROPERTY CXX_STANDARD 20)
+set_source_files_properties(
+  ${SFWN_SOURCE_DIR}/third_party/miniply.cpp
+  PROPERTIES COMPILE_OPTIONS "-w"
+)
+
+add_executable(sfwn_probe sfwn/probe.cpp)
+target_link_libraries(sfwn_probe PRIVATE mitsuba)
+set_property(TARGET sfwn_probe PROPERTY CXX_STANDARD 20)
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU)$")
   # Treat undefined symbols as errors when linking
   target_link_libraries(mitsuba PRIVATE -Wl,--no-undefined)
