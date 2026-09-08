@@ -3,6 +3,7 @@
 #include <mitsuba/core/properties.h>
 #include <mitsuba/render/interaction.h>
 #include <mitsuba/render/medium.h>
+#include <mitsuba/render/phase.h>
 #include <mitsuba/render/sfwn.h>
 
 #include <algorithm>
@@ -37,21 +38,80 @@ public:
 
         m_field = SfwnField::load(filename.string(), weighted_normals,
                                   t_divisor, inv_beta, model, regularization);
+
+        // Medium and phase must describe the same field, or the extinction and
+        // the scattering lobe come from different geometry. Because fields are
+        // cached, identical parameters give an identical pointer, so this is an
+        // exact comparison of every field parameter at once.
+        if (const auto *holder =
+                dynamic_cast<const SfwnFieldHolder *>(m_phase_function.get())) {
+            if (holder->sfwn_field() != m_field.get())
+                Throw("SFWN medium and its phase function were configured "
+                      "against different fields. Every field parameter must "
+                      "match.\n  medium: %s\n  phase:  %s",
+                      m_field->describe(), holder->sfwn_field()->describe());
+        } else {
+            Log(Warn,
+                "SFWN medium has a non-SFWN phase function (%s). Extinction "
+                "will use the directional SFWN sigma while scattering does "
+                "not; this is only meaningful as a deliberate experiment.",
+                m_phase_function->class_name());
+        }
+
         m_scale = props.get<ScalarFloat>("scale", 1.f);
-        m_extinction_offset =
-            props.get<ScalarFloat>("extinction_offset", 0.f);
-        if (m_extinction_offset < 0.f)
-            Throw("SFWN extinction_offset must be nonnegative");
         m_albedo = props.get<ScalarFloat>("albedo", 1.f);
         m_albedo = std::clamp(m_albedo, ScalarFloat(0), ScalarFloat(1));
         m_zero_invalid_extinction =
             props.get<bool>("zero_invalid_extinction", false);
+
+        // The spatial weight selects which extinction the medium reads, and the
+        // two have different far-field baselines, so it has to be resolved
+        // before the baseline is requested.
         std::string spatial_weight =
             props.get<std::string>("spatial_weight", "density");
         if (spatial_weight == "surfaceness")
             m_use_surfaceness = true;
         else if (spatial_weight != "density")
             Throw("SFWN spatial_weight must be 'density' or 'surfaceness'");
+
+        // The far-field baseline belongs to the field, not to this medium, so
+        // take it from the field by default. Measurement is lazy and cached, so
+        // several media sharing a field measure it once between them.
+        const SfwnBaseline &baseline =
+            m_field->far_field_baseline(m_use_surfaceness);
+        // Round up: this clamps the background to exactly zero, at the cost of
+        // at most one unit of the faintest signal. See the README.
+        ScalarFloat measured =
+            baseline.samples ? ScalarFloat(std::ceil(baseline.mean))
+                             : ScalarFloat(0);
+        if (baseline.samples)
+            Log(Info,
+                "SFWN far-field baseline: mean=%g (spread %g..%g over %zu "
+                "samples), ceil=%g",
+                baseline.mean, baseline.min, baseline.max, baseline.samples,
+                measured);
+
+        if (props.has_property("extinction_offset")) {
+            m_extinction_offset = props.get<ScalarFloat>("extinction_offset");
+            if (baseline.samples &&
+                std::abs(m_extinction_offset - measured) > 1.f)
+                Log(Warn,
+                    "SFWN extinction_offset=%g was set explicitly, but the "
+                    "measured far-field baseline for this field is %g. One of "
+                    "the two is stale -- the offset is a property of the field "
+                    "(%s) and of spatial_weight=%s.",
+                    m_extinction_offset, measured, m_field->describe(),
+                    spatial_weight);
+        } else if (baseline.samples) {
+            m_extinction_offset = measured;
+        } else {
+            m_extinction_offset = 0.f;
+            Log(Warn,
+                "SFWN could not measure a far-field baseline for this field "
+                "(no finite samples); falling back to extinction_offset=0");
+        }
+        if (m_extinction_offset < 0.f)
+            Throw("SFWN extinction_offset must be nonnegative");
 
         ScalarFloat padding = props.get<ScalarFloat>("bbox_padding", 0.05f);
         const auto &bounds = m_field->bounds();

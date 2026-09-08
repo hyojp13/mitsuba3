@@ -10,7 +10,8 @@
 NAMESPACE_BEGIN(mitsuba)
 
 template <typename Float, typename Spectrum>
-class SfwnPhaseFunction final : public PhaseFunction<Float, Spectrum> {
+class SfwnPhaseFunction final : public PhaseFunction<Float, Spectrum>,
+                                public SfwnFieldHolder {
 public:
     MI_IMPORT_BASE(PhaseFunction, m_flags)
     MI_IMPORT_TYPES(PhaseFunctionContext)
@@ -92,6 +93,11 @@ public:
             pdf = 0.f;
         return { Spectrum(pdf), pdf };
     }
+
+    /// SfwnFieldHolder: lets the enclosing sfwnmedium confirm that medium and
+    /// phase were configured against the same field. Fields are cached, so an
+    /// identical configuration yields an identical pointer.
+    const SfwnField *sfwn_field() const override { return m_field.get(); }
 
     std::string to_string() const override {
         std::ostringstream oss;

@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
@@ -61,6 +62,16 @@ std::array<double, 3> from_point(const ExactGaussian::Point &value) {
     return { value[0], value[1], value[2] };
 }
 
+/// `index`-th point of a golden-angle spiral of `count` points on the unit
+/// sphere. Used for both the probe positions and the query directions.
+std::array<double, 3> spiral_point(std::size_t index, std::size_t count) {
+    constexpr double golden_angle = 2.39996322972865332;
+    double z = 1.0 - 2.0 * (double(index) + 0.5) / double(count);
+    double radius = std::sqrt(std::max(0.0, 1.0 - z * z));
+    double phi = golden_angle * double(index);
+    return { radius * std::cos(phi), radius * std::sin(phi), z };
+}
+
 std::string cache_key(const std::string &filename, bool weighted_normals,
                       double t_divisor, double inv_beta,
                       const std::string &model,
@@ -78,17 +89,25 @@ struct SfwnField::Impl {
     FieldVariant field;
     SfwnBounds bounds;
     std::string filename;
+    bool weighted_normals;
     double t;
     double t_divisor;
     double inv_beta;
     std::string model;
     std::string regularization;
 
+    // Lazily measured far-field baselines, indexed by the spatial weight
+    // ([0] = density, [1] = surfaceness). Populated at most once each and
+    // never reset, so references handed out by far_field_baseline() stay valid.
+    mutable std::mutex baseline_mutex;
+    mutable std::optional<SfwnBaseline> baseline_cache[2];
+
     Impl(const std::string &filename_, bool weighted_normals, double t_divisor_,
          double inv_beta_, const std::string &model,
          const std::string &regularization)
-        : filename(filename_), t(0.0), t_divisor(t_divisor_),
-          inv_beta(inv_beta_), model(model), regularization(regularization) {
+        : filename(filename_), weighted_normals(weighted_normals),
+          t(0.0), t_divisor(t_divisor_), inv_beta(inv_beta_), model(model),
+          regularization(regularization) {
         if (t_divisor <= 0.0 || !std::isfinite(t_divisor))
             throw std::runtime_error(
                 "SFWN t_divisor must be finite and positive");
@@ -306,6 +325,93 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
         m_impl->field);
     return maximum;
 }
+
+SfwnBaseline SfwnField::measure_far_field_baseline(
+    bool use_surfaceness, std::size_t position_count,
+    std::size_t direction_count, double radius_scale) const {
+    position_count = std::max<std::size_t>(position_count, 1);
+    direction_count = std::max<std::size_t>(direction_count, 1);
+
+    const auto &b = m_impl->bounds;
+    const std::array<double, 3> center = { 0.5 * (b.min[0] + b.max[0]),
+                                           0.5 * (b.min[1] + b.max[1]),
+                                           0.5 * (b.min[2] + b.max[2]) };
+    double dx = b.max[0] - b.min[0], dy = b.max[1] - b.min[1],
+           dz = b.max[2] - b.min[2];
+    double bounding_radius = 0.5 * std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (!(bounding_radius > 0.0) || !std::isfinite(bounding_radius))
+        bounding_radius = 1.0;
+    const double radius = radius_scale * bounding_radius;
+
+    double sum = 0.0;
+    double minimum = std::numeric_limits<double>::infinity();
+    double maximum = -std::numeric_limits<double>::infinity();
+    std::size_t samples = 0;
+
+    std::visit(
+        [&](const auto &owned) {
+            using Point =
+                typename std::remove_reference_t<decltype(*owned)>::Point;
+            for (std::size_t i = 0; i < position_count; ++i) {
+                auto offset = spiral_point(i, position_count);
+                Point p(center[0] + radius * offset[0],
+                        center[1] + radius * offset[1],
+                        center[2] + radius * offset[2]);
+                for (std::size_t j = 0; j < direction_count; ++j) {
+                    auto d = spiral_point(j, direction_count);
+                    Point w(d[0], d[1], d[2]);
+                    double value;
+                    if (use_surfaceness) {
+                        constexpr sfwn::Output outputs =
+                            sfwn::Output::Surfaceness | sfwn::Output::Sigma;
+                        auto result = owned->template query<outputs>(
+                            p, m_impl->t, m_impl->inv_beta, w);
+                        value = result.surfaceness * result.sigma;
+                    } else {
+                        constexpr sfwn::Output outputs =
+                            sfwn::Output::Density | sfwn::Output::Sigma;
+                        auto result = owned->template query<outputs>(
+                            p, m_impl->t, m_impl->inv_beta, w);
+                        value = result.density * result.sigma;
+                    }
+                    if (!std::isfinite(value))
+                        continue;
+                    sum += value;
+                    minimum = std::min(minimum, value);
+                    maximum = std::max(maximum, value);
+                    ++samples;
+                }
+            }
+        },
+        m_impl->field);
+
+    if (samples == 0)
+        return SfwnBaseline{ 0.0, 0.0, 0.0, 0 };
+    return SfwnBaseline{ sum / double(samples), minimum, maximum, samples };
+}
+
+const SfwnBaseline &SfwnField::far_field_baseline(bool use_surfaceness) const {
+    const std::size_t slot = use_surfaceness ? 1u : 0u;
+    std::lock_guard<std::mutex> lock(m_impl->baseline_mutex);
+    if (!m_impl->baseline_cache[slot])
+        m_impl->baseline_cache[slot] =
+            measure_far_field_baseline(use_surfaceness);
+    return *m_impl->baseline_cache[slot];
+}
+
+std::string SfwnField::describe() const {
+    std::ostringstream oss;
+    oss << std::filesystem::path(m_impl->filename).filename().string()
+        << ", model=" << m_impl->model
+        << ", regularization=" << m_impl->regularization
+        << ", t_divisor=" << m_impl->t_divisor
+        << ", t=" << std::setprecision(9) << m_impl->t
+        << ", inv_beta=" << m_impl->inv_beta
+        << ", weighted_normals=" << (m_impl->weighted_normals ? "true" : "false");
+    return oss.str();
+}
+
+SfwnFieldHolder::~SfwnFieldHolder() = default;
 
 const SfwnBounds &SfwnField::bounds() const { return m_impl->bounds; }
 

@@ -1,6 +1,7 @@
 #include <mitsuba/render/sfwn.h>
 
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
@@ -9,9 +10,9 @@
 using mitsuba::SfwnField;
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 6) {
+    if (argc < 3 || argc > 7) {
         std::cerr << "Usage: sfwn_probe POINTS.ply t_divisor [inv_beta] "
-                     "[regularization] [model]\n";
+                     "[regularization] [model] [radius_scale]\n";
         return 2;
     }
 
@@ -19,6 +20,9 @@ int main(int argc, char **argv) {
     double inv_beta = argc >= 4 ? std::stod(argv[3]) : 0.2;
     std::string regularization = argc >= 5 ? argv[4] : "gaussian";
     std::string model = argc >= 6 ? argv[5] : "exact";
+    // Default matches SfwnField::measure_far_field_baseline's default, so a
+    // bare probe run reports exactly the baseline sfwnmedium would use.
+    double radius_scale = argc >= 7 ? std::stod(argv[6]) : 8.0;
     auto field = SfwnField::load(argv[1], false, t_divisor, inv_beta,
                                  model, regularization);
     const auto &bounds = field->bounds();
@@ -35,7 +39,22 @@ int main(int argc, char **argv) {
               << " t=" << field->regularization_parameter()
               << " inv_beta=" << field->inv_beta()
               << " model=" << field->volume_model()
-              << " regularization=" << field->regularization() << '\n'
+              << " regularization=" << field->regularization() << '\n';
+
+    // The far-field baseline is what sfwnmedium subtracts as extinction_offset.
+    // Report both spatial weights: they have different baselines.
+    for (bool use_surfaceness : { false, true }) {
+        auto b = field->measure_far_field_baseline(use_surfaceness, 300, 24,
+                                                   radius_scale);
+        std::cout << "# far_field_baseline["
+                  << (use_surfaceness ? "surfaceness" : "density")
+                  << "] mean=" << b.mean << " min=" << b.min
+                  << " max=" << b.max << " samples=" << b.samples
+                  << " radius_scale=" << radius_scale
+                  << " => extinction_offset=" << std::ceil(b.mean) << '\n';
+    }
+
+    std::cout
               << "z,mean,variance,occupancy,surfaceness,density,sigma,"
                  "extinction_surfaceness,extinction_density\n";
     double span = bounds.max[2] - bounds.min[2];
