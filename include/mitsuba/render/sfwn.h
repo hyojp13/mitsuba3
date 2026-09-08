@@ -143,6 +143,20 @@ public:
     virtual ~SfwnFieldHolder();
     /// The field this plugin was configured with; never null after construction.
     virtual const SfwnField *sfwn_field() const = 0;
+
+    /**
+     * Adopt the enclosing medium's placement, as a row-major 4x4 world-to-object
+     * matrix.
+     *
+     * A phase function is evaluated with world-space directions but queries a
+     * field that lives in object space, so it needs the same transform as its
+     * medium. Pushing it down here rather than re-declaring `to_world` on the
+     * phase keeps the two from drifting apart, in the same spirit as the field
+     * comparison above. Implementations must reject a second, different
+     * transform: that means one phase function is shared by two differently
+     * placed media, which cannot be honoured.
+     */
+    virtual void set_sfwn_world_to_object(const std::array<double, 16> &m) = 0;
 };
 
 NAMESPACE_END(mitsuba)

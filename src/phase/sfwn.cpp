@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cmath>
+#include <stdexcept>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -43,19 +44,22 @@ public:
         if (!active)
             return { Vector3f(0.f), Spectrum(0.f), 0.f };
 
-        std::array<double, 3> p = { double(mi.p[0]), double(mi.p[1]),
-                                    double(mi.p[2]) };
-        std::array<double, 3> w = { -double(mi.wi[0]), -double(mi.wi[1]),
-                                    -double(mi.wi[2]) };
+        // The field lives in object space; work there throughout and rotate
+        // the sampled direction back at the end. A rotation preserves solid
+        // angle, so the pdf needs no Jacobian for the change of frame.
+        Vector3f wi = rotate(mi.wi, false);
+        std::array<double, 3> p = to_object(mi.p);
+        std::array<double, 3> w = { -double(wi[0]), -double(wi[1]),
+                                    -double(wi[2]) };
         std::array<double, 3> u = { double(sample1), double(sample2[0]),
                                     double(sample2[1]) };
         SfwnVndfSample sample = m_field->sample_vndf(p, w, u);
         Normal3f m(ScalarFloat(sample.normal[0]),
                    ScalarFloat(sample.normal[1]),
                    ScalarFloat(sample.normal[2]));
-        Float jacobian = 4.f * dr::abs(dr::dot(mi.wi, m));
+        Float jacobian = 4.f * dr::abs(dr::dot(wi, m));
         Float pdf = Float(sample.pdf) / jacobian;
-        Vector3f wo = dr::normalize(reflect(mi.wi, m));
+        Vector3f wo = rotate(dr::normalize(reflect(wi, m)), true);
 
         bool valid = std::isfinite(double(pdf)) && pdf > 0.f &&
                      std::isfinite(double(wo[0])) &&
@@ -71,23 +75,24 @@ public:
              const Vector3f &wo, Mask active) const override {
         if (!active)
             return { 0.f, 0.f };
-        Vector3f sum = wo + mi.wi;
+        Vector3f wi_o = rotate(mi.wi, false);
+        Vector3f wo_o = rotate(wo, false);
+        Vector3f sum = wo_o + wi_o;
         Float sum_norm = dr::norm(sum);
         if (!(sum_norm > 0.f))
             return { 0.f, 0.f };
         Vector3f m = sum / sum_norm;
-        Vector3f propagation = -mi.wi;
+        Vector3f propagation = -wi_o;
         if (dr::dot(m, propagation) < 0.f)
             m = -m;
 
-        std::array<double, 3> p = { double(mi.p[0]), double(mi.p[1]),
-                                    double(mi.p[2]) };
+        std::array<double, 3> p = to_object(mi.p);
         std::array<double, 3> w = { double(propagation[0]),
                                     double(propagation[1]),
                                     double(propagation[2]) };
         std::array<double, 3> normal = { double(m[0]), double(m[1]),
                                          double(m[2]) };
-        Float jacobian = 4.f * dr::abs(dr::dot(wo, m));
+        Float jacobian = 4.f * dr::abs(dr::dot(wo_o, m));
         Float pdf = Float(m_field->vndf(p, w, normal)) / jacobian;
         if (!std::isfinite(double(pdf)) || pdf < 0.f)
             pdf = 0.f;
@@ -98,6 +103,20 @@ public:
     /// phase were configured against the same field. Fields are cached, so an
     /// identical configuration yields an identical pointer.
     const SfwnField *sfwn_field() const override { return m_field.get(); }
+
+    void set_sfwn_world_to_object(const std::array<double, 16> &m) override {
+        if (m_has_transform && m != m_world_to_object)
+            Throw("A single sfwnphase is shared by two sfwnmedium instances "
+                  "with different to_world transforms. Give each medium its "
+                  "own phase function.");
+        m_world_to_object = m;
+        m_has_transform = true;
+        // Directions only need the linear part. For the similarity transforms
+        // sfwnmedium admits this is a uniformly scaled rotation, so normalising
+        // after applying it (or its transpose, for the inverse) recovers the
+        // rotation exactly and the uniform scale drops out.
+        m_identity = (m == identity_matrix());
+    }
 
     std::string to_string() const override {
         std::ostringstream oss;
@@ -117,7 +136,47 @@ public:
     MI_DECLARE_CLASS(SfwnPhaseFunction)
 
 private:
+    static constexpr std::array<double, 16> identity_matrix() {
+        return { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    }
+
+    /// World-space point to the field's object space.
+    std::array<double, 3> to_object(const Point3f &p) const {
+        if (m_identity)
+            return { double(p[0]), double(p[1]), double(p[2]) };
+        const auto &m = m_world_to_object;
+        double x = double(p[0]), y = double(p[1]), z = double(p[2]);
+        return { m[0] * x + m[1] * y + m[2] * z + m[3],
+                 m[4] * x + m[5] * y + m[6] * z + m[7],
+                 m[8] * x + m[9] * y + m[10] * z + m[11] };
+    }
+
+    /// World-space direction to object space. `transpose` inverts it: for a
+    /// uniformly scaled rotation the transpose is the inverse up to the scale,
+    /// which normalisation removes.
+    Vector3f rotate(const Vector3f &v, bool transpose) const {
+        if (m_identity)
+            return v;
+        const auto &m = m_world_to_object;
+        double x = double(v[0]), y = double(v[1]), z = double(v[2]);
+        double a, b, c;
+        if (!transpose) {
+            a = m[0] * x + m[1] * y + m[2] * z;
+            b = m[4] * x + m[5] * y + m[6] * z;
+            c = m[8] * x + m[9] * y + m[10] * z;
+        } else {
+            a = m[0] * x + m[4] * y + m[8] * z;
+            b = m[1] * x + m[5] * y + m[9] * z;
+            c = m[2] * x + m[6] * y + m[10] * z;
+        }
+        return dr::normalize(Vector3f(ScalarFloat(a), ScalarFloat(b),
+                                      ScalarFloat(c)));
+    }
+
     SfwnField::Ptr m_field;
+    std::array<double, 16> m_world_to_object = identity_matrix();
+    bool m_has_transform = false;
+    bool m_identity = true;
 };
 
 MI_EXPORT_PLUGIN(SfwnPhaseFunction)

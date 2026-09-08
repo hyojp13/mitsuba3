@@ -25,7 +25,7 @@ NAMESPACE_BEGIN(mitsuba)
 template <typename Float, typename Spectrum>
 class SfwnSurface final : public Shape<Float, Spectrum> {
 public:
-    MI_IMPORT_BASE(Shape, m_is_instance, m_shape_type,
+    MI_IMPORT_BASE(Shape, m_to_world, m_is_instance, m_shape_type,
                    initialize, get_children_string)
     MI_IMPORT_TYPES()
 
@@ -65,13 +65,21 @@ public:
             ScalarPoint3f(bounds.max[0] + padding, bounds.max[1] + padding,
                           bounds.max[2] + padding));
 
+        // m_bbox above is in the field's object space. The accelerator needs a
+        // world-space box, so transform the eight corners; the Shape base has
+        // already read to_world from the properties.
+        const ScalarAffineTransform4f &to_world = m_to_world.scalar();
+        m_world_bbox = ScalarBoundingBox3f();
+        for (int i = 0; i < 8; ++i)
+            m_world_bbox.expand(to_world * m_bbox.corner(i));
+
         m_shape_type = ShapeType::SDFGrid;
         initialize();
     }
 
     ScalarSize primitive_count() const override { return 1; }
 
-    ScalarBoundingBox3f bbox() const override { return m_bbox; }
+    ScalarBoundingBox3f bbox() const override { return m_world_bbox; }
 
     Float surface_area() const override { return 0.f; }
 
@@ -107,10 +115,15 @@ public:
                      dr::zeros<dr::uint32_array_t<FloatP>>() };
         } else {
 
+        // Transform into object space without renormalising the direction, so
+        // the parametric distances found below remain valid for the world ray.
+        auto to_object = m_to_world.scalar().inverse();
+        auto o_local = to_object * ray_.o;
+        auto d_local = to_object * ray_.d;
         std::array<double, 3> origin = {
-            double(ray_.o[0]), double(ray_.o[1]), double(ray_.o[2]) };
+            double(o_local[0]), double(o_local[1]), double(o_local[2]) };
         std::array<double, 3> direction = {
-            double(ray_.d[0]), double(ray_.d[1]), double(ray_.d[2]) };
+            double(d_local[0]), double(d_local[1]), double(d_local[2]) };
         double t_near = 0.0;
         double t_far = double(ray_.maxt);
         if (!intersect_bbox(origin, direction, t_near, t_far))
@@ -167,13 +180,17 @@ public:
             return dr::zeros<SurfaceInteraction3f>();
 
         Point3f p = ray(pi.t);
+        const AffineTransform4f &to_world = m_to_world.value();
+        Point3f p_local = to_world.inverse() * p;
         std::array<double, 3> position = {
-            double(p[0]), double(p[1]), double(p[2]) };
+            double(p_local[0]), double(p_local[1]), double(p_local[2]) };
         SfwnSurfaceSample value = sample(position);
-        Vector3f gradient(ScalarFloat(value.gradient[0]),
+        // The gradient is an object-space normal, so it maps to world space
+        // through the inverse transpose, which Transform applies to Normal3f.
+        Normal3f gradient(ScalarFloat(value.gradient[0]),
                           ScalarFloat(value.gradient[1]),
                           ScalarFloat(value.gradient[2]));
-        Normal3f normal = dr::normalize(-gradient);
+        Normal3f normal = dr::normalize(to_world * Normal3f(-gradient));
 
         SurfaceInteraction3f si = dr::zeros<SurfaceInteraction3f>();
         si.t = pi.t;
@@ -246,7 +263,8 @@ private:
     }
 
     SfwnField::Ptr m_field;
-    ScalarBoundingBox3f m_bbox;
+    ScalarBoundingBox3f m_bbox;        //< object space
+    ScalarBoundingBox3f m_world_bbox;  //< m_bbox under to_world
     ScalarFloat m_surface_level = 0.5f;
     uint32_t m_ray_steps = 128;
     uint32_t m_refine_steps = 6;

@@ -1,6 +1,7 @@
 #include <mitsuba/core/bbox.h>
 #include <mitsuba/core/fresolver.h>
 #include <mitsuba/core/properties.h>
+#include <mitsuba/core/transform.h>
 #include <mitsuba/render/interaction.h>
 #include <mitsuba/render/medium.h>
 #include <mitsuba/render/phase.h>
@@ -56,6 +57,32 @@ public:
                 "will use the directional SFWN sigma while scattering does "
                 "not; this is only meaningful as a deliberate experiment.",
                 m_phase_function->class_name());
+        }
+
+        // Medium has no to_world of its own, so read it here. The field is in
+        // object space from now on; rays are transformed into it.
+        m_to_world = props.get<ScalarAffineTransform4f>(
+            "to_world", ScalarAffineTransform4f());
+        if (!m_to_world.is_similarity())
+            Throw("SFWN medium to_world must be a similarity transform "
+                  "(rotation, uniform scale, translation). sigma_t has units "
+                  "of inverse length, so a non-uniform scale would need a "
+                  "direction-dependent correction the field does not model.");
+        m_to_object = m_to_world.inverse();
+        // Uniform scale factor: object lengths times m_world_scale are world
+        // lengths, so world-space sigma_t is the field's value divided by it.
+        m_world_scale =
+            dr::norm(m_to_world * ScalarVector3f(1.f, 0.f, 0.f));
+        if (!(m_world_scale > 0.f) || !std::isfinite(m_world_scale))
+            Throw("SFWN medium to_world has a degenerate scale");
+
+        if (auto *holder =
+                dynamic_cast<SfwnFieldHolder *>(m_phase_function.get())) {
+            std::array<double, 16> m;
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    m[r * 4 + c] = double(m_to_object.matrix.entry(r, c));
+            holder->set_sfwn_world_to_object(m);
         }
 
         m_scale = props.get<ScalarFloat>("scale", 1.f);
@@ -161,7 +188,10 @@ public:
 
     UnpolarizedSpectrum get_majorant(const MediumInteraction3f &,
                                      Mask active) const override {
-        return dr::select(active, UnpolarizedSpectrum(m_majorant),
+        // m_majorant bounds the field in object units; tracking happens along
+        // world-space rays.
+        return dr::select(active,
+                          UnpolarizedSpectrum(m_majorant / m_world_scale),
                           UnpolarizedSpectrum(0.f));
     }
 
@@ -172,10 +202,13 @@ public:
         if (!active)
             return { 0.f, 0.f, 0.f };
 
-        std::array<double, 3> p = { double(mi.p[0]), double(mi.p[1]),
-                                    double(mi.p[2]) };
-        std::array<double, 3> w = { -double(mi.wi[0]), -double(mi.wi[1]),
-                                    -double(mi.wi[2]) };
+        ScalarPoint3f po = m_to_object * ScalarPoint3f(mi.p);
+        ScalarVector3f wo_dir =
+            dr::normalize(m_to_object * ScalarVector3f(-mi.wi));
+        std::array<double, 3> p = { double(po[0]), double(po[1]),
+                                    double(po[2]) };
+        std::array<double, 3> w = { double(wo_dir[0]), double(wo_dir[1]),
+                                    double(wo_dir[2]) };
         ScalarFloat raw =
             ScalarFloat(m_field->extinction(p, w, m_use_surfaceness));
         if (!std::isfinite(raw) || raw < 0.f) {
@@ -205,16 +238,25 @@ public:
             sigma = m_majorant;
         }
 
-        UnpolarizedSpectrum sigma_t(sigma);
+        // Convert from the field's object-space units to world units. Both
+        // sigma_t and sigma_n are divided, so sigma_t + sigma_n still equals
+        // the majorant get_majorant() reports.
+        UnpolarizedSpectrum sigma_t(sigma / m_world_scale);
         UnpolarizedSpectrum sigma_s = sigma_t * m_albedo;
         UnpolarizedSpectrum sigma_n =
-            UnpolarizedSpectrum(m_majorant) - sigma_t;
+            UnpolarizedSpectrum(m_majorant / m_world_scale) - sigma_t;
         return { sigma_s, sigma_n, sigma_t };
     }
 
     std::tuple<Mask, Float, Float>
     intersect_aabb(const Ray3f &ray) const override {
-        return m_bbox.ray_intersect(ray);
+        // m_bbox is in object space. Transforming the ray without renormalising
+        // its direction keeps the returned parametric distances valid for the
+        // original world-space ray.
+        Ray3f local(ray);
+        local.o = m_to_object * ray.o;
+        local.d = m_to_object * ray.d;
+        return m_bbox.ray_intersect(local);
     }
 
     std::string to_string() const override {
@@ -246,7 +288,10 @@ public:
 
 private:
     SfwnField::Ptr m_field;
-    ScalarBoundingBox3f m_bbox;
+    ScalarBoundingBox3f m_bbox;   //< object space
+    ScalarAffineTransform4f m_to_world;
+    ScalarAffineTransform4f m_to_object;
+    ScalarFloat m_world_scale = 1.f;
     ScalarFloat m_scale;
     ScalarFloat m_extinction_offset;
     ScalarFloat m_albedo;
