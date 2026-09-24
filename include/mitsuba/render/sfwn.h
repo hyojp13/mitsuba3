@@ -79,10 +79,23 @@ public:
         const std::array<double, 3> &direction,
         const std::array<double, 3> &sample) const;
 
+    /**
+     * Upper bound on sigma_t over the field, for delta tracking.
+     *
+     * Sampling only at the cloud's own points underestimates badly: extinction
+     * peaks in a shell just *inside* the surface, not on it. On bunny10k with
+     * gaussian t_divisor=10 the maximum at the points is ~119 while the true
+     * maximum is ~226 -- a factor of 1.9 that a blanket 2x safety factor was
+     * only accidentally covering. Each sampled point is therefore also probed
+     * at `shell_samples` offsets either side along its normal, out to
+     * `shell_radius` times the bounding-box diagonal.
+     */
     double estimate_majorant(std::size_t direction_count = 24,
                              std::size_t max_points = 2000,
                              bool use_surfaceness = false,
-                             double extinction_offset = 0.0) const;
+                             double extinction_offset = 0.0,
+                             std::size_t shell_samples = 5,
+                             double shell_radius = 0.02) const;
 
     /**
      * Measure the far-field extinction baseline of this field.

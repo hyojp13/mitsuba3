@@ -11,8 +11,59 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 
 NAMESPACE_BEGIN(mitsuba)
+
+/**
+ * Majorant-exceedance totals, reported once at process exit.
+ *
+ * A medium cannot report this itself: Mitsuba never destroys the scene before
+ * exiting, so ~SfwnMedium does not run (verified -- not even a bare fprintf in
+ * it produces output). An atexit handler is the one hook that reliably fires,
+ * and it writes to stderr directly because the logger may already be gone.
+ *
+ * Totals are aggregated across media rather than kept per-instance; a scene
+ * with several SFWN media is rare, and the peak ratio is the actionable
+ * number either way.
+ */
+namespace {
+std::atomic<std::size_t> g_exceed_count{ 0 };
+std::atomic<double> g_exceed_peak{ 0.0 };
+std::atomic<double> g_exceed_peak_majorant{ 0.0 };
+std::once_flag g_exceed_atexit;
+
+void sfwn_report_exceedances() {
+    std::size_t count = g_exceed_count.load(std::memory_order_relaxed);
+    if (count == 0)
+        return;
+    double peak = g_exceed_peak.load(std::memory_order_relaxed);
+    double majorant = g_exceed_peak_majorant.load(std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "WARN  [SfwnMedium] majorant exceeded %zu times; sigma_t was "
+                 "clamped, peaking at %g against a majorant of %g (%.2fx). "
+                 "Delta tracking is biased thin wherever that happened -- "
+                 "raise majorant_safety, widen majorant_shell_radius, or set "
+                 "majorant explicitly.\n",
+                 count, peak, majorant,
+                 majorant > 0.0 ? peak / majorant : 0.0);
+}
+
+void sfwn_note_exceedance(double sigma, double majorant) {
+    g_exceed_count.fetch_add(1, std::memory_order_relaxed);
+    double prev = g_exceed_peak.load(std::memory_order_relaxed);
+    while (sigma > prev &&
+           !g_exceed_peak.compare_exchange_weak(prev, sigma,
+                                                std::memory_order_relaxed))
+        ;
+    if (sigma >= g_exceed_peak.load(std::memory_order_relaxed))
+        g_exceed_peak_majorant.store(majorant, std::memory_order_relaxed);
+    std::call_once(g_exceed_atexit,
+                   [] { std::atexit(sfwn_report_exceedances); });
+}
+}  // namespace
 
 template <typename Float, typename Spectrum>
 class SfwnMedium final : public Medium<Float, Spectrum> {
@@ -152,12 +203,29 @@ public:
         if (m_majorant <= 0.f) {
             size_t directions = props.get<size_t>("majorant_directions", 24);
             size_t points = props.get<size_t>("majorant_points", 2000);
+            // The estimator probes a shell around each point, not just the
+            // point itself, because sigma_t peaks just inside the surface.
+            // That removes a systematic ~1.9x underestimate, so the safety
+            // factor no longer has to silently cover one and can be modest.
+            size_t shell_samples =
+                props.get<size_t>("majorant_shell_samples", 5);
+            ScalarFloat shell_radius =
+                props.get<ScalarFloat>("majorant_shell_radius", 0.02f);
             ScalarFloat safety =
                 props.get<ScalarFloat>("majorant_safety", 2.f);
-            m_majorant = m_scale * safety * ScalarFloat(
+            ScalarFloat raw = ScalarFloat(
                 m_field->estimate_majorant(directions, points,
                                             m_use_surfaceness,
-                                            m_extinction_offset));
+                                            m_extinction_offset,
+                                            shell_samples,
+                                            double(shell_radius)));
+            m_majorant = m_scale * safety * raw;
+            Log(Info,
+                "SFWN majorant: shell-sampled max=%g (%zu points x %zu "
+                "directions x %zu shell offsets, radius=%g of bbox diagonal), "
+                "safety=%g => majorant=%g",
+                raw, points, directions, 2 * shell_samples + 1, shell_radius,
+                safety, m_majorant);
         }
         if (!(m_majorant > 0.f) || !std::isfinite(m_majorant))
             Throw("SFWN medium could not determine a valid majorant");
@@ -224,6 +292,11 @@ public:
         ScalarFloat sigma =
             m_scale * std::max(ScalarFloat(0), raw - m_extinction_offset);
         if (sigma > m_majorant) {
+            // Count every exceedance, not just the ones worth warning about:
+            // clamping biases the medium thin wherever it happens, and a total
+            // is the only way to know whether that mattered. This branch is
+            // rare for a valid majorant, so the atomics stay off the hot path.
+            sfwn_note_exceedance(double(sigma), double(m_majorant));
             ScalarFloat reported =
                 m_max_reported.load(std::memory_order_relaxed);
             ScalarFloat report_threshold =

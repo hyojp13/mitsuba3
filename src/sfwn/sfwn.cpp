@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 #include <variant>
 
 NAMESPACE_BEGIN(mitsuba)
@@ -283,18 +284,56 @@ SfwnVndfSample SfwnField::sample_vndf(
 double SfwnField::estimate_majorant(std::size_t direction_count,
                                     std::size_t max_points,
                                     bool use_surfaceness,
-                                    double extinction_offset) const {
+                                    double extinction_offset,
+                                    std::size_t shell_samples,
+                                    double shell_radius) const {
     direction_count = std::max<std::size_t>(direction_count, 6);
     max_points = std::max<std::size_t>(max_points, 1);
     constexpr double golden_angle = 2.39996322972865332;
     double maximum = 0.0;
+
+    // Offsets to probe along each point's normal, in world units. The peak
+    // sits inside the surface, so the set is symmetric rather than one-sided
+    // only because a cloud's normals are not guaranteed to point outward.
+    const auto &b = m_impl->bounds;
+    const double dx = b.max[0] - b.min[0], dy = b.max[1] - b.min[1],
+                 dz = b.max[2] - b.min[2];
+    const double diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
+    std::vector<double> offsets;
+    offsets.push_back(0.0);
+    if (shell_samples > 0 && shell_radius > 0.0 && diagonal > 0.0) {
+        const double step = shell_radius * diagonal / double(shell_samples);
+        for (std::size_t k = 1; k <= shell_samples; ++k) {
+            offsets.push_back(double(k) * step);
+            offsets.push_back(-double(k) * step);
+        }
+    }
 
     std::visit(
         [&](const auto &owned) {
             const auto count = static_cast<std::size_t>(owned->dataset().num());
             const auto stride = std::max<std::size_t>(1, count / max_points);
             for (std::size_t i = 0; i < count; i += stride) {
-                auto p = owned->dataset().getPoint(i);
+              using OwnedPoint =
+                  typename std::remove_reference_t<decltype(*owned)>::Point;
+              const auto base = owned->dataset().getPoint(i);
+              // getNormal returns unitNormal * voronoiArea (see pc.h), so it
+              // must be renormalised before it can measure a distance. Points
+              // with zero area give no direction; probe only the point itself.
+              const auto weighted = owned->dataset().getNormal(i);
+              const double wx = double(weighted[0]), wy = double(weighted[1]),
+                           wz = double(weighted[2]);
+              const double wlen = std::sqrt(wx * wx + wy * wy + wz * wz);
+              const bool has_normal = wlen > 0.0 && std::isfinite(wlen);
+              const double ux = has_normal ? wx / wlen : 0.0;
+              const double uy = has_normal ? wy / wlen : 0.0;
+              const double uz = has_normal ? wz / wlen : 0.0;
+              for (double offset : offsets) {
+                if (offset != 0.0 && !has_normal)
+                    continue;
+                OwnedPoint p(double(base[0]) + ux * offset,
+                             double(base[1]) + uy * offset,
+                             double(base[2]) + uz * offset);
                 for (std::size_t j = 0; j < direction_count; ++j) {
                     double z = 1.0 - 2.0 * (double(j) + 0.5) /
                                          double(direction_count);
@@ -320,6 +359,7 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                         maximum = std::max(
                             maximum, std::max(0.0, value - extinction_offset));
                 }
+              }
             }
         },
         m_impl->field);
