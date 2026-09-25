@@ -10,9 +10,9 @@
 using mitsuba::SfwnField;
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 7) {
+    if (argc < 3 || argc > 8) {
         std::cerr << "Usage: sfwn_probe POINTS.ply t_divisor [inv_beta] "
-                     "[regularization] [model] [radius_scale]\n";
+                     "[regularization] [model] [radius_scale] [process]\n";
         return 2;
     }
 
@@ -23,8 +23,9 @@ int main(int argc, char **argv) {
     // Default matches SfwnField::measure_far_field_baseline's default, so a
     // bare probe run reports exactly the baseline sfwnmedium would use.
     double radius_scale = argc >= 7 ? std::stod(argv[6]) : 8.0;
+    std::string process = argc >= 8 ? argv[7] : "sensitivity";
     auto field = SfwnField::load(argv[1], false, t_divisor, inv_beta,
-                                 model, regularization);
+                                 model, regularization, process);
     const auto &bounds = field->bounds();
     std::array<double, 3> p = {
         0.5 * (bounds.min[0] + bounds.max[0]),
@@ -39,7 +40,8 @@ int main(int argc, char **argv) {
               << " t=" << field->regularization_parameter()
               << " inv_beta=" << field->inv_beta()
               << " model=" << field->volume_model()
-              << " regularization=" << field->regularization() << '\n';
+              << " regularization=" << field->regularization()
+              << " process=" << field->process() << '\n';
 
     // The far-field baseline is what sfwnmedium subtracts as extinction_offset.
     // Report both spatial weights: they have different baselines.

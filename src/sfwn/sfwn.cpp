@@ -28,38 +28,69 @@ namespace {
 using PointCloud = sfwn::PointCloud<sfwn::Traits<double>>;
 using Octree = sfwn::Octree<PointCloud>;
 using BarnesHut = sfwn::BarnesHut<Octree>;
-using ExactGaussian = sfwn::Gpis<BarnesHut, sfwn::Accumulation::Direct, 32,
-                                sfwn::VolumeModel::Exact,
-                                sfwn::Regularization::Gaussian>;
-using SmithGaussian = sfwn::Gpis<BarnesHut, sfwn::Accumulation::Direct, 32,
-                                sfwn::VolumeModel::Smith,
-                                sfwn::Regularization::Gaussian>;
-using ExactMiyamotoNagai =
-    sfwn::Gpis<BarnesHut, sfwn::Accumulation::Direct, 32,
-               sfwn::VolumeModel::Exact,
-               sfwn::Regularization::MiyamotoNagai>;
-using SmithMiyamotoNagai =
-    sfwn::Gpis<BarnesHut, sfwn::Accumulation::Direct, 32,
-               sfwn::VolumeModel::Smith,
-               sfwn::Regularization::MiyamotoNagai>;
+// One field type now: the volume model, regularizer and GP model moved out of
+// the class template into QueryOptions on each query, so a single octree and
+// set of Barnes-Hut aggregates serves every combination.
+using Gpis = sfwn::Gpis<BarnesHut>;
 
 template <typename T> using Owned = std::unique_ptr<T>;
-using FieldVariant =
-    std::variant<Owned<ExactGaussian>, Owned<SmithGaussian>,
-                 Owned<ExactMiyamotoNagai>, Owned<SmithMiyamotoNagai>>;
 
-template <typename Gpis>
+/// Carries a compile-time QueryOptions into a generic lambda.
+template <sfwn::QueryOptions Q>
+struct OptsTag { static constexpr sfwn::QueryOptions value = Q; };
+
+/**
+ * Turn the runtime (process, model, regularization) strings into the
+ * compile-time QueryOptions every query is templated on. Eight combinations,
+ * spelled out: QueryOptions is a non-type template parameter, so there is no
+ * way to build one from runtime values.
+ */
+template <typename F>
+decltype(auto) dispatch_options(bool sensitivity, bool smith, bool mn, F &&f) {
+    using QO = sfwn::QueryOptions;
+    using GP = sfwn::GaussianProcessModel;
+    using VM = sfwn::VolumeModel;
+    using RG = sfwn::Regularization;
+    if (sensitivity) {
+        if (smith) {
+            if (mn)
+                return f(OptsTag<QO{ .process = GP::Sensitivity, .model = VM::Smith,
+                                     .regularizer = RG::MiyamotoNagai }>{});
+            return f(OptsTag<QO{ .process = GP::Sensitivity, .model = VM::Smith,
+                                 .regularizer = RG::Gaussian }>{});
+        }
+        if (mn)
+            return f(OptsTag<QO{ .process = GP::Sensitivity, .model = VM::Exact,
+                                 .regularizer = RG::MiyamotoNagai }>{});
+        return f(OptsTag<QO{ .process = GP::Sensitivity, .model = VM::Exact,
+                             .regularizer = RG::Gaussian }>{});
+    }
+    if (smith) {
+        if (mn)
+            return f(OptsTag<QO{ .process = GP::Prior, .model = VM::Smith,
+                                 .regularizer = RG::MiyamotoNagai }>{});
+        return f(OptsTag<QO{ .process = GP::Prior, .model = VM::Smith,
+                             .regularizer = RG::Gaussian }>{});
+    }
+    if (mn)
+        return f(OptsTag<QO{ .process = GP::Prior, .model = VM::Exact,
+                             .regularizer = RG::MiyamotoNagai }>{});
+    return f(OptsTag<QO{ .process = GP::Prior, .model = VM::Exact,
+                         .regularizer = RG::Gaussian }>{});
+}
+
 Owned<Gpis> make_field(const std::string &filename, bool weighted_normals) {
     return std::make_unique<Gpis>(
         filename, weighted_normals,
-        sfwn::BuildOptions<sfwn::Threading::Multi, PointCloud::nodeWidth>{});
+        sfwn::BuildTag<sfwn::BuildOptions{ .threading = sfwn::Threading::Multi,
+                                           .numNeighbors = int(PointCloud::nodeWidth) }>{});
 }
 
-ExactGaussian::Point to_point(const std::array<double, 3> &value) {
-    return ExactGaussian::Point(value[0], value[1], value[2]);
+Gpis::Point to_point(const std::array<double, 3> &value) {
+    return Gpis::Point(value[0], value[1], value[2]);
 }
 
-std::array<double, 3> from_point(const ExactGaussian::Point &value) {
+std::array<double, 3> from_point(const Gpis::Point &value) {
     return { value[0], value[1], value[2] };
 }
 
@@ -76,18 +107,20 @@ std::array<double, 3> spiral_point(std::size_t index, std::size_t count) {
 std::string cache_key(const std::string &filename, bool weighted_normals,
                       double t_divisor, double inv_beta,
                       const std::string &model,
-                      const std::string &regularization) {
+                      const std::string &regularization,
+                      const std::string &process) {
     std::ostringstream oss;
     oss << std::filesystem::weakly_canonical(filename).string() << '|'
         << weighted_normals << '|' << std::setprecision(17) << t_divisor << '|'
-        << inv_beta << '|' << model << '|' << regularization;
+        << inv_beta << '|' << model << '|' << regularization << '|'
+        << process;
     return oss.str();
 }
 
 } // namespace
 
 struct SfwnField::Impl {
-    FieldVariant field;
+    Owned<Gpis> field;
     SfwnBounds bounds;
     std::string filename;
     bool weighted_normals;
@@ -96,6 +129,15 @@ struct SfwnField::Impl {
     double inv_beta;
     std::string model;
     std::string regularization;
+    std::string process;
+
+    /// Run `f(optsTag, field)` with this field's QueryOptions as a constant.
+    template <typename F>
+    decltype(auto) with_options(F &&f) const {
+        return dispatch_options(process == "sensitivity", model == "smith",
+                                regularization == "miyamoto_nagai",
+                                [&](auto opts) { return f(opts, field); });
+    }
 
     // Lazily measured far-field baselines, indexed by the spatial weight
     // ([0] = density, [1] = surfaceness). Populated at most once each and
@@ -105,42 +147,40 @@ struct SfwnField::Impl {
 
     Impl(const std::string &filename_, bool weighted_normals, double t_divisor_,
          double inv_beta_, const std::string &model,
-         const std::string &regularization)
+         const std::string &regularization, const std::string &process)
         : filename(filename_), weighted_normals(weighted_normals),
           t(0.0), t_divisor(t_divisor_), inv_beta(inv_beta_), model(model),
-          regularization(regularization) {
+          regularization(regularization), process(process) {
         if (t_divisor <= 0.0 || !std::isfinite(t_divisor))
             throw std::runtime_error(
                 "SFWN t_divisor must be finite and positive");
         if (inv_beta < 0.0)
             throw std::runtime_error("SFWN inv_beta must be nonnegative");
 
-        if (model == "exact" && regularization == "gaussian")
-            field = make_field<ExactGaussian>(filename, weighted_normals);
-        else if (model == "smith" && regularization == "gaussian")
-            field = make_field<SmithGaussian>(filename, weighted_normals);
-        else if (model == "exact" && regularization == "miyamoto_nagai")
-            field = make_field<ExactMiyamotoNagai>(filename, weighted_normals);
-        else if (model == "smith" && regularization == "miyamoto_nagai")
-            field = make_field<SmithMiyamotoNagai>(filename, weighted_normals);
-        else
+        if (model != "exact" && model != "smith")
+            throw std::runtime_error("SFWN model must be exact or smith");
+        if (regularization != "gaussian" && regularization != "miyamoto_nagai")
             throw std::runtime_error(
-                "SFWN model must be exact/smith and regularization must be "
-                "gaussian/miyamoto_nagai");
+                "SFWN regularization must be gaussian or miyamoto_nagai");
+        if (process != "sensitivity" && process != "prior")
+            throw std::runtime_error(
+                "SFWN process must be sensitivity or prior");
 
-        std::visit(
-            [&](const auto &owned) {
-                if (!owned || owned->dataset().num() == 0)
-                    throw std::runtime_error("SFWN failed to load point cloud: " +
-                                             filename);
-                const auto bbox = owned->dataset().bbox();
-                bounds.min = from_point(bbox.low);
-                bounds.max = from_point(bbox.high);
-                t = owned->areaToRegularizationParameter(
-                        owned->dataset().minArea()) /
-                    t_divisor;
-            },
-            field);
+        // One field serves every option combination now, so this no longer
+        // branches on model/regularization to pick a type.
+        field = make_field(filename, weighted_normals);
+        if (!field || field->dataset().num() == 0)
+            throw std::runtime_error("SFWN failed to load point cloud: " +
+                                     filename);
+        const auto bbox = field->dataset().bbox();
+        bounds.min = from_point(bbox.low);
+        bounds.max = from_point(bbox.high);
+        // areaToRegularizationParameter is templated on the regularizer now.
+        t = with_options([&](auto opts, const auto &owned) {
+                return owned->template areaToRegularizationParameter<
+                           decltype(opts)::value.regularizer>(
+                           owned->dataset().minArea());
+            }) / t_divisor;
 
         if (!(t > 0.0) || !std::isfinite(t))
             throw std::runtime_error(
@@ -154,19 +194,20 @@ SfwnField::~SfwnField() = default;
 SfwnField::Ptr SfwnField::load(const std::string &filename,
                                bool weighted_normals, double t_divisor,
                                double inv_beta, const std::string &model,
-                               const std::string &regularization) {
+                               const std::string &regularization,
+                               const std::string &process) {
     static std::mutex mutex;
     static std::unordered_map<std::string, std::weak_ptr<const SfwnField>> cache;
 
     std::string key = cache_key(filename, weighted_normals, t_divisor, inv_beta,
-                                model, regularization);
+                                model, regularization, process);
     std::lock_guard<std::mutex> lock(mutex);
     if (auto existing = cache[key].lock())
         return existing;
 
     auto result = std::shared_ptr<const SfwnField>(new SfwnField(
         std::make_unique<Impl>(filename, weighted_normals, t_divisor, inv_beta,
-                               model, regularization)));
+                               model, regularization, process)));
     cache[key] = result;
     return result;
 }
@@ -175,13 +216,12 @@ double SfwnField::sigma(const std::array<double, 3> &position,
                         const std::array<double, 3> &direction) const {
     auto p = to_point(position);
     auto w = to_point(direction);
-    return std::visit(
-        [&](const auto &owned) {
-            return owned->template query<sfwn::Output::Sigma>(
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
+            return owned->template query<sfwn::OutputOptions::Sigma, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w)
                 .sigma;
-        },
-        m_impl->field);
+        });
 }
 
 SfwnScalarDiagnostics SfwnField::diagnostics(
@@ -189,31 +229,30 @@ SfwnScalarDiagnostics SfwnField::diagnostics(
     const std::array<double, 3> &direction) const {
     auto p = to_point(position);
     auto w = to_point(direction);
-    return std::visit(
-        [&](const auto &owned) {
-            constexpr sfwn::Output outputs =
-                sfwn::Output::Mean | sfwn::Output::Variance |
-                sfwn::Output::Occupancy | sfwn::Output::Surfaceness |
-                sfwn::Output::Density | sfwn::Output::Sigma;
-            auto result = owned->template query<outputs>(
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
+            constexpr sfwn::OutputOptions outputs =
+                sfwn::OutputOptions::Mean | sfwn::OutputOptions::Variance |
+                sfwn::OutputOptions::Occupancy | sfwn::OutputOptions::Surfaceness |
+                sfwn::OutputOptions::Density | sfwn::OutputOptions::Sigma;
+            auto result = owned->template query<outputs, decltype(opts)::value>(
                 p, m_impl->t, m_impl->inv_beta, w);
             return SfwnScalarDiagnostics{
                 result.mean, result.variance, result.occupancy,
                 result.surfaceness, result.density, result.sigma
             };
-        },
-        m_impl->field);
+        });
 }
 
 SfwnSurfaceSample SfwnField::surface_sample(
     const std::array<double, 3> &position, bool use_mean) const {
     auto p = to_point(position);
-    return std::visit(
-        [&](const auto &owned) {
-            constexpr sfwn::Output outputs =
-                sfwn::Output::Mean | sfwn::Output::Occupancy |
-                sfwn::Output::NormalMean;
-            auto result = owned->template query<outputs>(
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
+            constexpr sfwn::OutputOptions outputs =
+                sfwn::OutputOptions::Mean | sfwn::OutputOptions::Occupancy |
+                sfwn::OutputOptions::NormalMean;
+            auto result = owned->template query<outputs, decltype(opts)::value>(
                 p, m_impl->t, m_impl->inv_beta);
             const auto &gradient = result.normalMean;
             return SfwnSurfaceSample{
@@ -221,8 +260,7 @@ SfwnSurfaceSample SfwnField::surface_sample(
                 { double(gradient[0]), double(gradient[1]),
                   double(gradient[2]) }
             };
-        },
-        m_impl->field);
+        });
 }
 
 double SfwnField::extinction(const std::array<double, 3> &position,
@@ -230,23 +268,22 @@ double SfwnField::extinction(const std::array<double, 3> &position,
                              bool use_surfaceness) const {
     auto p = to_point(position);
     auto w = to_point(direction);
-    return std::visit(
-        [&](const auto &owned) {
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
             if (use_surfaceness) {
-                constexpr sfwn::Output outputs =
-                    sfwn::Output::Surfaceness | sfwn::Output::Sigma;
-                auto result = owned->template query<outputs>(
+                constexpr sfwn::OutputOptions outputs =
+                    sfwn::OutputOptions::Surfaceness | sfwn::OutputOptions::Sigma;
+                auto result = owned->template query<outputs, decltype(opts)::value>(
                     p, m_impl->t, m_impl->inv_beta, w);
                 return result.surfaceness * result.sigma;
             } else {
-                constexpr sfwn::Output outputs =
-                    sfwn::Output::Density | sfwn::Output::Sigma;
-                auto result = owned->template query<outputs>(
+                constexpr sfwn::OutputOptions outputs =
+                    sfwn::OutputOptions::Density | sfwn::OutputOptions::Sigma;
+                auto result = owned->template query<outputs, decltype(opts)::value>(
                     p, m_impl->t, m_impl->inv_beta, w);
                 return result.density * result.sigma;
             }
-        },
-        m_impl->field);
+        });
 }
 
 double SfwnField::vndf(const std::array<double, 3> &position,
@@ -255,13 +292,12 @@ double SfwnField::vndf(const std::array<double, 3> &position,
     auto p = to_point(position);
     auto w = to_point(direction);
     auto m = to_point(micro_normal);
-    return std::visit(
-        [&](const auto &owned) {
-            return owned->template query<sfwn::Output::VNDF>(
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
+            return owned->template query<sfwn::OutputOptions::VNDF, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w, m)
                 .vndf;
-        },
-        m_impl->field);
+        });
 }
 
 SfwnVndfSample SfwnField::sample_vndf(
@@ -271,14 +307,13 @@ SfwnVndfSample SfwnField::sample_vndf(
     auto p = to_point(position);
     auto w = to_point(direction);
     auto u = to_point(sample);
-    return std::visit(
-        [&](const auto &owned) {
-            auto result = owned->template query<sfwn::Output::VndfSample>(
+    return m_impl->with_options(
+        [&](auto opts, const auto &owned) {
+            auto result = owned->template query<sfwn::OutputOptions::VndfSample, decltype(opts)::value>(
                 p, m_impl->t, m_impl->inv_beta, w, w, u);
             return SfwnVndfSample{ from_point(result.vndfSample),
                                    result.vndfSamplePdf };
-        },
-        m_impl->field);
+        });
 }
 
 double SfwnField::estimate_majorant(std::size_t direction_count,
@@ -309,8 +344,8 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
         }
     }
 
-    std::visit(
-        [&](const auto &owned) {
+    m_impl->with_options(
+        [&](auto opts, const auto &owned) {
             const auto count = static_cast<std::size_t>(owned->dataset().num());
             const auto stride = std::max<std::size_t>(1, count / max_points);
             for (std::size_t i = 0; i < count; i += stride) {
@@ -343,15 +378,15 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                         radius * std::cos(phi), radius * std::sin(phi), z);
                     double value;
                     if (use_surfaceness) {
-                        constexpr sfwn::Output outputs =
-                            sfwn::Output::Surfaceness | sfwn::Output::Sigma;
-                        auto result = owned->template query<outputs>(
+                        constexpr sfwn::OutputOptions outputs =
+                            sfwn::OutputOptions::Surfaceness | sfwn::OutputOptions::Sigma;
+                        auto result = owned->template query<outputs, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w);
                         value = result.surfaceness * result.sigma;
                     } else {
-                        constexpr sfwn::Output outputs =
-                            sfwn::Output::Density | sfwn::Output::Sigma;
-                        auto result = owned->template query<outputs>(
+                        constexpr sfwn::OutputOptions outputs =
+                            sfwn::OutputOptions::Density | sfwn::OutputOptions::Sigma;
+                        auto result = owned->template query<outputs, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w);
                         value = result.density * result.sigma;
                     }
@@ -361,8 +396,7 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                 }
               }
             }
-        },
-        m_impl->field);
+        });
     return maximum;
 }
 
@@ -388,8 +422,8 @@ SfwnBaseline SfwnField::measure_far_field_baseline(
     double maximum = -std::numeric_limits<double>::infinity();
     std::size_t samples = 0;
 
-    std::visit(
-        [&](const auto &owned) {
+    m_impl->with_options(
+        [&](auto opts, const auto &owned) {
             using Point =
                 typename std::remove_reference_t<decltype(*owned)>::Point;
             for (std::size_t i = 0; i < position_count; ++i) {
@@ -402,15 +436,15 @@ SfwnBaseline SfwnField::measure_far_field_baseline(
                     Point w(d[0], d[1], d[2]);
                     double value;
                     if (use_surfaceness) {
-                        constexpr sfwn::Output outputs =
-                            sfwn::Output::Surfaceness | sfwn::Output::Sigma;
-                        auto result = owned->template query<outputs>(
+                        constexpr sfwn::OutputOptions outputs =
+                            sfwn::OutputOptions::Surfaceness | sfwn::OutputOptions::Sigma;
+                        auto result = owned->template query<outputs, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w);
                         value = result.surfaceness * result.sigma;
                     } else {
-                        constexpr sfwn::Output outputs =
-                            sfwn::Output::Density | sfwn::Output::Sigma;
-                        auto result = owned->template query<outputs>(
+                        constexpr sfwn::OutputOptions outputs =
+                            sfwn::OutputOptions::Density | sfwn::OutputOptions::Sigma;
+                        auto result = owned->template query<outputs, decltype(opts)::value>(
                             p, m_impl->t, m_impl->inv_beta, w);
                         value = result.density * result.sigma;
                     }
@@ -422,8 +456,7 @@ SfwnBaseline SfwnField::measure_far_field_baseline(
                     ++samples;
                 }
             }
-        },
-        m_impl->field);
+        });
 
     if (samples == 0)
         return SfwnBaseline{ 0.0, 0.0, 0.0, 0 };
@@ -456,17 +489,14 @@ SfwnFieldHolder::~SfwnFieldHolder() = default;
 const SfwnBounds &SfwnField::bounds() const { return m_impl->bounds; }
 
 std::size_t SfwnField::point_count() const {
-    return std::visit(
-        [](const auto &owned) {
-            return static_cast<std::size_t>(owned->dataset().num());
-        },
-        m_impl->field);
+    return static_cast<std::size_t>(m_impl->field->dataset().num());
 }
 
 double SfwnField::regularization_parameter() const { return m_impl->t; }
 double SfwnField::regularization_divisor() const { return m_impl->t_divisor; }
 double SfwnField::inv_beta() const { return m_impl->inv_beta; }
 const std::string &SfwnField::volume_model() const { return m_impl->model; }
+const std::string &SfwnField::process() const { return m_impl->process; }
 const std::string &SfwnField::regularization() const {
     return m_impl->regularization;
 }

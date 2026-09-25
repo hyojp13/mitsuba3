@@ -45,6 +45,12 @@ public:
         std::string model = props.get<std::string>("model", "exact");
         std::string regularization =
             props.get<std::string>("regularization", "gaussian");
+        // "sensitivity" (the current model: variance is the data Gram, so it is
+        // non-negative at any t and zero far from the cloud) or "prior" (the GP
+        // posterior, prior minus data Gram, whose far field is a nonzero
+        // constant and whose variance can go negative).
+        std::string process =
+            props.get<std::string>("process", "sensitivity");
         m_use_mean = props.get<std::string>("field", "occupancy") == "mean";
         if (!m_use_mean && props.get<std::string>("field", "occupancy") != "occupancy")
             Throw("SFWN surface field must be 'mean' or 'occupancy'");
@@ -56,7 +62,7 @@ public:
             Throw("SFWN surface ray_steps must be at least 2");
 
         m_field = SfwnField::load(filename.string(), weighted_normals,
-                                  t_divisor, inv_beta, model, regularization);
+                                  t_divisor, inv_beta, model, regularization, process);
         const auto &bounds = m_field->bounds();
         ScalarFloat padding = props.get<ScalarFloat>("bbox_padding", 0.05f);
         m_bbox = ScalarBoundingBox3f(

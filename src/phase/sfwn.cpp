@@ -29,8 +29,14 @@ public:
         std::string model = props.get<std::string>("model", "exact");
         std::string regularization =
             props.get<std::string>("regularization", "gaussian");
+        // "sensitivity" (the current model: variance is the data Gram, so it is
+        // non-negative at any t and zero far from the cloud) or "prior" (the GP
+        // posterior, prior minus data Gram, whose far field is a nonzero
+        // constant and whose variance can go negative).
+        std::string process =
+            props.get<std::string>("process", "sensitivity");
         m_field = SfwnField::load(filename.string(), weighted_normals,
-                                  t_divisor, inv_beta, model, regularization);
+                                  t_divisor, inv_beta, model, regularization, process);
 
         // The companion medium already evaluates the full directional sigma.
         // Do not set Microflake, which would make Mitsuba multiply it again.

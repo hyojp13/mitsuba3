@@ -57,7 +57,8 @@ public:
     static Ptr load(const std::string &filename, bool weighted_normals,
                     double t_divisor, double inv_beta,
                     const std::string &model,
-                    const std::string &regularization);
+                    const std::string &regularization,
+                    const std::string &process = "sensitivity");
 
     ~SfwnField();
 
@@ -131,6 +132,9 @@ public:
     double inv_beta() const;
     const std::string &volume_model() const;
     const std::string &regularization() const;
+    /// "sensitivity" (no prior term; variance is the data Gram, zero far from
+    /// the cloud) or "prior" (GP posterior, prior minus data Gram).
+    const std::string &process() const;
     const std::string &filename() const;
 
 private:
