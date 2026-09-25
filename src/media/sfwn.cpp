@@ -51,6 +51,33 @@ void sfwn_report_exceedances() {
                  majorant > 0.0 ? peak / majorant : 0.0);
 }
 
+/**
+ * Zeroed-sample totals, reported once at process exit alongside the majorant
+ * exceedances and for the same reason: a long render that survives an invalid
+ * pocket has still been biased thin there, and a one-shot warning says nothing
+ * about how much. Counting makes the trade-off auditable after the fact.
+ */
+std::atomic<std::size_t> g_invalid_count{ 0 };
+std::once_flag g_invalid_atexit;
+
+void sfwn_report_invalid() {
+    std::size_t count = g_invalid_count.load(std::memory_order_relaxed);
+    if (count == 0)
+        return;
+    std::fprintf(stderr,
+                 "WARN  [SfwnMedium] zeroed %zu invalid extinction samples "
+                 "(zero_invalid_extinction=true); the medium is biased thin "
+                 "wherever the field was non-finite or negative. A large count "
+                 "means the field itself is unusable -- raise t_divisor.\n",
+                 count);
+}
+
+void sfwn_note_invalid() {
+    g_invalid_count.fetch_add(1, std::memory_order_relaxed);
+    std::call_once(g_invalid_atexit,
+                   [] { std::atexit(sfwn_report_invalid); });
+}
+
 void sfwn_note_exceedance(double sigma, double majorant) {
     g_exceed_count.fetch_add(1, std::memory_order_relaxed);
     double prev = g_exceed_peak.load(std::memory_order_relaxed);
@@ -283,10 +310,12 @@ public:
             if (!m_zero_invalid_extinction)
                 Throw("SFWN produced invalid extinction at [%g, %g, %g]",
                       p[0], p[1], p[2]);
+            sfwn_note_invalid();
             if (!m_invalid_reported.exchange(true, std::memory_order_relaxed))
                 Log(Warn,
-                    "Replacing non-finite SFWN extinction with zero for the "
-                    "faulty-field diagnostic render");
+                    "Replacing invalid SFWN extinction with zero at "
+                    "[%g, %g, %g]; the running total is reported at exit",
+                    p[0], p[1], p[2]);
             raw = 0.f;
         }
         ScalarFloat sigma =
