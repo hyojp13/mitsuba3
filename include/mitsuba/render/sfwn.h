@@ -43,6 +43,21 @@ struct SfwnSurfaceSample {
  * directions. `samples` counts the finite queries that contributed, and is
  * zero if the field produced no usable value at all.
  */
+/**
+ * Distribution of sampled extinction, for choosing a majorant.
+ *
+ * The maximum is a true bound over the sampled set but is set by a handful of
+ * near-singular points: on Church the max is 24217 while the bulk of the
+ * distribution sits orders of magnitude lower. Quantiles let the bound cover
+ * the body of the distribution instead, trading a small, *measured* clamping
+ * rate for a majorant that delta tracking can actually afford.
+ */
+struct SfwnMajorantStats {
+    double max = 0.0;
+    double p50 = 0.0, p90 = 0.0, p99 = 0.0, p999 = 0.0, p9999 = 0.0;
+    std::size_t samples = 0;
+};
+
 struct SfwnBaseline {
     double mean;
     double min;
@@ -110,6 +125,15 @@ public:
      */
     std::size_t write_filtered_ply(const std::string &filename,
                                    double min_area) const;
+
+    /// Sampled-extinction distribution behind estimate_majorant().
+    SfwnMajorantStats majorant_stats(std::size_t direction_count = 16,
+                                     std::size_t max_points = 0,
+                                     bool use_surfaceness = false,
+                                     double extinction_offset = 0.0,
+                                     std::size_t shell_samples = 4,
+                                     double shell_radius = 0.02,
+                                     double shell_t_scale = 3.0) const;
 
     double estimate_majorant(std::size_t direction_count = 24,
                              std::size_t max_points = 2000,

@@ -264,20 +264,36 @@ public:
                 props.get<ScalarFloat>("majorant_shell_t_scale", 3.f);
             ScalarFloat safety =
                 props.get<ScalarFloat>("majorant_safety", 2.f);
+            // Which quantile of the sampled extinction distribution to bound.
+            // 100 is the maximum, a true bound over the sampled set but one
+            // that a few near-singular points can push orders of magnitude
+            // above the body of the distribution, making delta tracking
+            // unaffordable. A lower quantile covers the bulk and leaves a
+            // small clamping rate, which the exit report then measures.
+            ScalarFloat quantile =
+                props.get<ScalarFloat>("majorant_quantile", 100.f);
+            auto stats = m_field->majorant_stats(
+                directions, points, m_use_surfaceness, m_extinction_offset,
+                shell_samples, double(shell_radius), double(shell_t_scale));
+            Log(Info,
+                "SFWN extinction distribution over %zu samples: p50=%g "
+                "p90=%g p99=%g p99.9=%g p99.99=%g max=%g",
+                stats.samples, stats.p50, stats.p90, stats.p99, stats.p999,
+                stats.p9999, stats.max);
             ScalarFloat raw = ScalarFloat(
-                m_field->estimate_majorant(directions, points,
-                                            m_use_surfaceness,
-                                            m_extinction_offset,
-                                            shell_samples,
-                                            double(shell_radius),
-                                            double(shell_t_scale)));
+                quantile >= 100.f   ? stats.max
+                : quantile >= 99.99f ? stats.p9999
+                : quantile >= 99.9f  ? stats.p999
+                : quantile >= 99.f   ? stats.p99
+                : quantile >= 90.f   ? stats.p90
+                                     : stats.p50);
             m_majorant = m_scale * safety * raw;
             Log(Info,
                 "SFWN majorant: shell-sampled max=%g (%zu points probed x %zu "
-                "directions x %zu shell offsets, reach=%g*t), safety=%g "
-                "=> majorant=%g",
+                "directions x %zu shell offsets, reach=%g*t, quantile=%g), "
+                "safety=%g => majorant=%g",
                 raw, points ? points : m_field->point_count(), directions,
-                2 * shell_samples + 1, shell_t_scale,
+                2 * shell_samples + 1, shell_t_scale, quantile,
                 safety, m_majorant);
         }
         if (!(m_majorant > 0.f) || !std::isfinite(m_majorant))

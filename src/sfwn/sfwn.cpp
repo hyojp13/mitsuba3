@@ -369,7 +369,7 @@ std::size_t SfwnField::write_filtered_ply(const std::string &filename,
     return kept.size();
 }
 
-double SfwnField::estimate_majorant(std::size_t direction_count,
+SfwnMajorantStats SfwnField::majorant_stats(std::size_t direction_count,
                                     std::size_t max_points,
                                     bool use_surfaceness,
                                     double extinction_offset,
@@ -377,6 +377,14 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                                     double shell_radius,
                                     double shell_t_scale) const {
     direction_count = std::max<std::size_t>(direction_count, 6);
+    // Log-space histogram of every sampled value, so quantiles cost O(1)
+    // memory rather than retaining ~1e8 samples. 24 decades at 0.01 dex gives
+    // the quantile to within ~2.3%, far finer than the choice of quantile.
+    constexpr int kBins = 2400;
+    constexpr double kLogMin = -12.0, kLogMax = 12.0;
+    const double bin_scale = double(kBins) / (kLogMax - kLogMin);
+    std::vector<std::size_t> hist(kBins + 2, 0);
+    std::size_t total = 0;
     // max_points == 0 is the "probe every point" sentinel, so it must not be
     // clamped up to 1 here - that would sample a single point.
     constexpr double golden_angle = 2.39996322972865332;
@@ -467,9 +475,21 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                             p, m_impl->t, m_impl->inv_beta, w);
                         value = result.density * result.sigma;
                     }
-                    if (std::isfinite(value))
-                        local_max = std::max(
-                            local_max, std::max(0.0, value - extinction_offset));
+                    if (std::isfinite(value)) {
+                        const double e =
+                            std::max(0.0, value - extinction_offset);
+                        local_max = std::max(local_max, e);
+                        int bin = 0;
+                        if (e > 0.0) {
+                            const double l = std::log10(e);
+                            bin = int((l - kLogMin) * bin_scale) + 1;
+                            bin = std::clamp(bin, 0, kBins + 1);
+                        }
+                        #pragma omp atomic
+                        ++hist[std::size_t(bin)];
+                        #pragma omp atomic
+                        ++total;
+                    }
                 }
               }
             }
@@ -477,7 +497,45 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
             // into `maximum` is unreliable when it is a lambda capture.
             maximum = std::max(maximum, local_max);
         });
-    return maximum;
+
+    SfwnMajorantStats stats;
+    stats.max = maximum;
+    stats.samples = total;
+    auto quantile = [&](double q) {
+        if (total == 0)
+            return 0.0;
+        const auto target = std::size_t(q * double(total));
+        std::size_t seen = 0;
+        for (int b = 0; b <= kBins + 1; ++b) {
+            seen += hist[std::size_t(b)];
+            if (seen >= target) {
+                if (b == 0)
+                    return 0.0;
+                // Upper edge of the bin: a bound over the bin's contents.
+                return std::pow(10.0, kLogMin + double(b) / bin_scale);
+            }
+        }
+        return maximum;
+    };
+    stats.p50 = quantile(0.50);
+    stats.p90 = quantile(0.90);
+    stats.p99 = quantile(0.99);
+    stats.p999 = quantile(0.999);
+    stats.p9999 = quantile(0.9999);
+    return stats;
+}
+
+double SfwnField::estimate_majorant(std::size_t direction_count,
+                                    std::size_t max_points,
+                                    bool use_surfaceness,
+                                    double extinction_offset,
+                                    std::size_t shell_samples,
+                                    double shell_radius,
+                                    double shell_t_scale) const {
+    return majorant_stats(direction_count, max_points, use_surfaceness,
+                          extinction_offset, shell_samples, shell_radius,
+                          shell_t_scale)
+        .max;
 }
 
 SfwnBaseline SfwnField::measure_far_field_baseline(
