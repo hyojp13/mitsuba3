@@ -241,37 +241,37 @@ public:
             ScalarPoint3f(bounds.max[0] + padding, bounds.max[1] + padding,
                           bounds.max[2] + padding));
 
+        // Read every estimator control unconditionally: Mitsuba rejects a
+        // scene with unused parameters, and when `majorant` is given the
+        // estimation branch below never runs, so reading them there made
+        // an explicit majorant fail to load.
+        size_t directions = props.get<size_t>("majorant_directions", 16);
+        size_t points = props.get<size_t>("majorant_points", 0);
+        size_t shell_samples = props.get<size_t>("majorant_shell_samples", 4);
+        ScalarFloat shell_radius = props.get<ScalarFloat>("majorant_shell_radius", 0.02f);
+        ScalarFloat shell_t_scale = props.get<ScalarFloat>("majorant_shell_t_scale", 3.f);
+        ScalarFloat safety = props.get<ScalarFloat>("majorant_safety", 2.f);
+        ScalarFloat quantile = props.get<ScalarFloat>("majorant_quantile", 100.f);
+
         m_majorant = props.get<ScalarFloat>("majorant", 0.f);
         if (m_majorant <= 0.f) {
             // 16 directions x 9 offsets x every point: coverage is what finds
             // the peak, so the budget goes there rather than into a denser
             // directional or normal-offset sweep.
-            size_t directions = props.get<size_t>("majorant_directions", 16);
             // 0 = probe every point. A fixed budget silently loses coverage as
             // the cloud grows, and coverage is what finds the peak.
-            size_t points = props.get<size_t>("majorant_points", 0);
             // The estimator probes a shell around each point, not just the
             // point itself, because sigma_t peaks just inside the surface.
             // That removes a systematic ~1.9x underestimate, so the safety
             // factor no longer has to silently cover one and can be modest.
-            size_t shell_samples =
-                props.get<size_t>("majorant_shell_samples", 4);
-            ScalarFloat shell_radius =
-                props.get<ScalarFloat>("majorant_shell_radius", 0.02f);
             // Probe reach in units of t, the thickness of the extinction
             // shell. Set <= 0 to fall back to the bounding-box-relative reach.
-            ScalarFloat shell_t_scale =
-                props.get<ScalarFloat>("majorant_shell_t_scale", 3.f);
-            ScalarFloat safety =
-                props.get<ScalarFloat>("majorant_safety", 2.f);
             // Which quantile of the sampled extinction distribution to bound.
             // 100 is the maximum, a true bound over the sampled set but one
             // that a few near-singular points can push orders of magnitude
             // above the body of the distribution, making delta tracking
             // unaffordable. A lower quantile covers the bulk and leaves a
             // small clamping rate, which the exit report then measures.
-            ScalarFloat quantile =
-                props.get<ScalarFloat>("majorant_quantile", 100.f);
             auto stats = m_field->majorant_stats(
                 directions, points, m_use_surfaceness, m_extinction_offset,
                 shell_samples, double(shell_radius), double(shell_t_scale));
