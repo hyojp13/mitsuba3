@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <cmath>
 #include <vector>
 
 NAMESPACE_BEGIN(mitsuba)
@@ -56,6 +57,38 @@ struct SfwnMajorantStats {
     double max = 0.0;
     double p50 = 0.0, p90 = 0.0, p99 = 0.0, p999 = 0.0, p9999 = 0.0;
     std::size_t samples = 0;
+
+    /// Log-spaced counts of every sampled value: bin 0 is exactly zero, the
+    /// rest cover [log_min, log_max] in equal decades, and the last catches
+    /// anything above. Retained so any quantile can be asked for afterwards
+    /// rather than only the handful named above.
+    std::vector<std::size_t> histogram;
+    double log_min = 0.0, log_max = 0.0;
+
+    /// (defined inline so plugins can call it without an exported symbol)
+        double quantile(double q) const {
+        if (samples == 0 || histogram.empty())
+            return 0.0;
+        if (q >= 1.0)
+            return max;
+        // Interior bins only; bin 0 holds exact zeros and the last holds the
+        // overflow, both of which the edge formula below would misreport.
+        const std::size_t bins = histogram.size() - 2;
+        const double scale = double(bins) / (log_max - log_min);
+        const auto target = std::size_t(q * double(samples));
+        std::size_t seen = 0;
+        for (std::size_t b = 0; b < histogram.size(); ++b) {
+            seen += histogram[b];
+            if (seen >= target) {
+                if (b == 0)
+                    return 0.0;
+                if (b > bins)
+                    return max;
+                return std::pow(10.0, log_min + double(b) / scale);
+            }
+        }
+        return max;
+    }
 };
 
 struct SfwnBaseline {

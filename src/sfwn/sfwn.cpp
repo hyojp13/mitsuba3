@@ -501,27 +501,14 @@ SfwnMajorantStats SfwnField::majorant_stats(std::size_t direction_count,
     SfwnMajorantStats stats;
     stats.max = maximum;
     stats.samples = total;
-    auto quantile = [&](double q) {
-        if (total == 0)
-            return 0.0;
-        const auto target = std::size_t(q * double(total));
-        std::size_t seen = 0;
-        for (int b = 0; b <= kBins + 1; ++b) {
-            seen += hist[std::size_t(b)];
-            if (seen >= target) {
-                if (b == 0)
-                    return 0.0;
-                // Upper edge of the bin: a bound over the bin's contents.
-                return std::pow(10.0, kLogMin + double(b) / bin_scale);
-            }
-        }
-        return maximum;
-    };
-    stats.p50 = quantile(0.50);
-    stats.p90 = quantile(0.90);
-    stats.p99 = quantile(0.99);
-    stats.p999 = quantile(0.999);
-    stats.p9999 = quantile(0.9999);
+    stats.histogram = std::move(hist);
+    stats.log_min = kLogMin;
+    stats.log_max = kLogMax;
+    stats.p50 = stats.quantile(0.50);
+    stats.p90 = stats.quantile(0.90);
+    stats.p99 = stats.quantile(0.99);
+    stats.p999 = stats.quantile(0.999);
+    stats.p9999 = stats.quantile(0.9999);
     return stats;
 }
 

@@ -280,13 +280,10 @@ public:
                 "p90=%g p99=%g p99.9=%g p99.99=%g max=%g",
                 stats.samples, stats.p50, stats.p90, stats.p99, stats.p999,
                 stats.p9999, stats.max);
+            // Any quantile, not a fixed ladder: 100 is the maximum.
             ScalarFloat raw = ScalarFloat(
-                quantile >= 100.f   ? stats.max
-                : quantile >= 99.99f ? stats.p9999
-                : quantile >= 99.9f  ? stats.p999
-                : quantile >= 99.f   ? stats.p99
-                : quantile >= 90.f   ? stats.p90
-                                     : stats.p50);
+                quantile >= 100.f ? stats.max
+                                  : stats.quantile(double(quantile) / 100.0));
             m_majorant = m_scale * safety * raw;
             Log(Info,
                 "SFWN majorant: shell-sampled max=%g (%zu points probed x %zu "
