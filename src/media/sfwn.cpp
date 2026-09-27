@@ -30,6 +30,7 @@ NAMESPACE_BEGIN(mitsuba)
  * number either way.
  */
 namespace {
+std::atomic<std::size_t> g_eval_count{ 0 };
 std::atomic<std::size_t> g_exceed_count{ 0 };
 std::atomic<double> g_exceed_peak{ 0.0 };
 std::atomic<double> g_exceed_peak_majorant{ 0.0 };
@@ -37,6 +38,12 @@ std::once_flag g_exceed_atexit;
 
 void sfwn_report_exceedances() {
     std::size_t count = g_exceed_count.load(std::memory_order_relaxed);
+    std::size_t evals = g_eval_count.load(std::memory_order_relaxed);
+    if (evals > 0)
+        std::fprintf(stderr,
+                     "INFO  [SfwnMedium] sigma_t evaluated %zu times; %zu "
+                     "exceeded the majorant (%.6f%%)\n",
+                     evals, count, 100.0 * double(count) / double(evals));
     if (count == 0)
         return;
     double peak = g_exceed_peak.load(std::memory_order_relaxed);
@@ -80,6 +87,8 @@ void sfwn_note_invalid() {
 
 void sfwn_note_exceedance(double sigma, double majorant) {
     g_exceed_count.fetch_add(1, std::memory_order_relaxed);
+    std::call_once(g_exceed_atexit,
+                   [] { std::atexit(sfwn_report_exceedances); });
     double prev = g_exceed_peak.load(std::memory_order_relaxed);
     while (sigma > prev &&
            !g_exceed_peak.compare_exchange_weak(prev, sigma,
@@ -234,16 +243,25 @@ public:
 
         m_majorant = props.get<ScalarFloat>("majorant", 0.f);
         if (m_majorant <= 0.f) {
-            size_t directions = props.get<size_t>("majorant_directions", 24);
-            size_t points = props.get<size_t>("majorant_points", 2000);
+            // 16 directions x 9 offsets x every point: coverage is what finds
+            // the peak, so the budget goes there rather than into a denser
+            // directional or normal-offset sweep.
+            size_t directions = props.get<size_t>("majorant_directions", 16);
+            // 0 = probe every point. A fixed budget silently loses coverage as
+            // the cloud grows, and coverage is what finds the peak.
+            size_t points = props.get<size_t>("majorant_points", 0);
             // The estimator probes a shell around each point, not just the
             // point itself, because sigma_t peaks just inside the surface.
             // That removes a systematic ~1.9x underestimate, so the safety
             // factor no longer has to silently cover one and can be modest.
             size_t shell_samples =
-                props.get<size_t>("majorant_shell_samples", 5);
+                props.get<size_t>("majorant_shell_samples", 4);
             ScalarFloat shell_radius =
                 props.get<ScalarFloat>("majorant_shell_radius", 0.02f);
+            // Probe reach in units of t, the thickness of the extinction
+            // shell. Set <= 0 to fall back to the bounding-box-relative reach.
+            ScalarFloat shell_t_scale =
+                props.get<ScalarFloat>("majorant_shell_t_scale", 3.f);
             ScalarFloat safety =
                 props.get<ScalarFloat>("majorant_safety", 2.f);
             ScalarFloat raw = ScalarFloat(
@@ -251,13 +269,14 @@ public:
                                             m_use_surfaceness,
                                             m_extinction_offset,
                                             shell_samples,
-                                            double(shell_radius)));
+                                            double(shell_radius),
+                                            double(shell_t_scale)));
             m_majorant = m_scale * safety * raw;
             Log(Info,
                 "SFWN majorant: shell-sampled max=%g (%zu points x %zu "
-                "directions x %zu shell offsets, radius=%g of bbox diagonal), "
-                "safety=%g => majorant=%g",
-                raw, points, directions, 2 * shell_samples + 1, shell_radius,
+                "directions x %zu shell offsets, reach=%g*t), safety=%g "
+                "=> majorant=%g",
+                raw, points, directions, 2 * shell_samples + 1, shell_t_scale,
                 safety, m_majorant);
         }
         if (!(m_majorant > 0.f) || !std::isfinite(m_majorant))
@@ -310,6 +329,9 @@ public:
                                     double(po[2]) };
         std::array<double, 3> w = { double(wo_dir[0]), double(wo_dir[1]),
                                     double(wo_dir[2]) };
+        if (g_eval_count.fetch_add(1, std::memory_order_relaxed) == 0)
+            std::call_once(g_exceed_atexit,
+                           [] { std::atexit(sfwn_report_exceedances); });
         ScalarFloat raw =
             ScalarFloat(m_field->extinction(p, w, m_use_surfaceness));
         if (!std::isfinite(raw) || raw < 0.f) {

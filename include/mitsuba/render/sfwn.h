@@ -88,15 +88,22 @@ public:
      * gaussian t_divisor=10 the maximum at the points is ~119 while the true
      * maximum is ~226 -- a factor of 1.9 that a blanket 2x safety factor was
      * only accidentally covering. Each sampled point is therefore also probed
-     * at `shell_samples` offsets either side along its normal, out to
-     * `shell_radius` times the bounding-box diagonal.
+     * at `shell_samples` offsets either side along its normal.
+     *
+     * The reach is `shell_t_scale * t`, because the extinction peak is a shell
+     * roughly `t` thick: scaling it to the bounding box instead (the old
+     * `shell_radius` behaviour, kept for `shell_t_scale <= 0`) makes the step
+     * 1.9x to 27x wider than that shell on these clouds, so the probe brackets
+     * the peak rather than landing on it and the resulting majorant is
+     * exceeded at render time.
      */
     double estimate_majorant(std::size_t direction_count = 24,
                              std::size_t max_points = 2000,
                              bool use_surfaceness = false,
                              double extinction_offset = 0.0,
-                             std::size_t shell_samples = 5,
-                             double shell_radius = 0.02) const;
+                             std::size_t shell_samples = 8,
+                             double shell_radius = 0.02,
+                             double shell_t_scale = 3.0) const;
 
     /**
      * Measure the far-field extinction baseline of this field.

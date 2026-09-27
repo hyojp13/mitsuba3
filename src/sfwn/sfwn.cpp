@@ -321,23 +321,33 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                                     bool use_surfaceness,
                                     double extinction_offset,
                                     std::size_t shell_samples,
-                                    double shell_radius) const {
+                                    double shell_radius,
+                                    double shell_t_scale) const {
     direction_count = std::max<std::size_t>(direction_count, 6);
-    max_points = std::max<std::size_t>(max_points, 1);
+    // max_points == 0 is the "probe every point" sentinel, so it must not be
+    // clamped up to 1 here - that would sample a single point.
     constexpr double golden_angle = 2.39996322972865332;
     double maximum = 0.0;
 
     // Offsets to probe along each point's normal, in world units. The peak
     // sits inside the surface, so the set is symmetric rather than one-sided
     // only because a cloud's normals are not guaranteed to point outward.
+    //
+    // The reach is t-relative: extinction peaks in a shell about t thick, so t
+    // is the only scale that makes the step mean the same thing on every
+    // cloud. The old bounding-box-relative reach gave a step 1.9x to 27x wider
+    // than that shell here, straddling the peak instead of sampling it.
     const auto &b = m_impl->bounds;
     const double dx = b.max[0] - b.min[0], dy = b.max[1] - b.min[1],
                  dz = b.max[2] - b.min[2];
     const double diagonal = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const double reach = (shell_t_scale > 0.0 && m_impl->t > 0.0)
+                             ? shell_t_scale * m_impl->t
+                             : shell_radius * diagonal;
     std::vector<double> offsets;
     offsets.push_back(0.0);
-    if (shell_samples > 0 && shell_radius > 0.0 && diagonal > 0.0) {
-        const double step = shell_radius * diagonal / double(shell_samples);
+    if (shell_samples > 0 && reach > 0.0) {
+        const double step = reach / double(shell_samples);
         for (std::size_t k = 1; k <= shell_samples; ++k) {
             offsets.push_back(double(k) * step);
             offsets.push_back(-double(k) * step);
@@ -347,8 +357,22 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
     m_impl->with_options(
         [&](auto opts, const auto &owned) {
             const auto count = static_cast<std::size_t>(owned->dataset().num());
-            const auto stride = std::max<std::size_t>(1, count / max_points);
-            for (std::size_t i = 0; i < count; i += stride) {
+            // max_points == 0 means "every point": coverage, not step size, is
+            // what decides whether this finds the peak. On Church the probe
+            // reports 21.2 over 2000 points and 56.2 over 20000, against a
+            // render that hit 60.9, so a fixed budget is the defect - it is
+            // 20% of bunny10k but 0.6% of a 300k-point scan.
+            const auto stride =
+                (max_points == 0)
+                    ? std::size_t(1)
+                    : std::max<std::size_t>(1, count / max_points);
+            const auto steps = (count + stride - 1) / stride;
+            // Parallel: full coverage is ~1e8 field queries, minutes of
+            // wall time serially and seconds across the pool.
+            double local_max = 0.0;
+            #pragma omp parallel for reduction(max : local_max) schedule(dynamic, 64)
+            for (std::size_t s = 0; s < steps; ++s) {
+                const std::size_t i = s * stride;
               using OwnedPoint =
                   typename std::remove_reference_t<decltype(*owned)>::Point;
               const auto base = owned->dataset().getPoint(i);
@@ -391,11 +415,14 @@ double SfwnField::estimate_majorant(std::size_t direction_count,
                         value = result.density * result.sigma;
                     }
                     if (std::isfinite(value))
-                        maximum = std::max(
-                            maximum, std::max(0.0, value - extinction_offset));
+                        local_max = std::max(
+                            local_max, std::max(0.0, value - extinction_offset));
                 }
               }
             }
+            // OpenMP reduces into local_max, a plain local: reducing directly
+            // into `maximum` is unreliable when it is a lambda capture.
+            maximum = std::max(maximum, local_max);
         });
     return maximum;
 }
