@@ -37,6 +37,10 @@ add_executable(sfwn_probe sfwn/probe.cpp)
 target_link_libraries(sfwn_probe PRIVATE mitsuba)
 set_property(TARGET sfwn_probe PROPERTY CXX_STANDARD 20)
 
+add_executable(sfwn_filter_areas sfwn/filter_areas.cpp)
+target_link_libraries(sfwn_filter_areas PRIVATE mitsuba)
+set_property(TARGET sfwn_filter_areas PROPERTY CXX_STANDARD 20)
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "^(GNU)$")
   # Treat undefined symbols as errors when linking
   target_link_libraries(mitsuba PRIVATE -Wl,--no-undefined)

@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -314,6 +315,58 @@ SfwnVndfSample SfwnField::sample_vndf(
             return SfwnVndfSample{ from_point(result.vndfSample),
                                    result.vndfSamplePdf };
         });
+}
+
+std::vector<double> SfwnField::point_areas() const {
+    // getNormal stores unitNormal * voronoiArea, so its length is the area.
+    const auto &ds = m_impl->field->dataset();
+    const auto n = static_cast<std::size_t>(ds.num());
+    std::vector<double> areas(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto v = ds.getNormal(i);
+        areas[i] = std::sqrt(double(v[0]) * double(v[0]) +
+                             double(v[1]) * double(v[1]) +
+                             double(v[2]) * double(v[2]));
+    }
+    return areas;
+}
+
+std::size_t SfwnField::write_filtered_ply(const std::string &filename,
+                                          double min_area) const {
+    const auto &ds = m_impl->field->dataset();
+    const auto n = static_cast<std::size_t>(ds.num());
+    std::vector<std::array<double, 6>> kept;
+    kept.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto v = ds.getNormal(i);
+        const double a = std::sqrt(double(v[0]) * double(v[0]) +
+                                   double(v[1]) * double(v[1]) +
+                                   double(v[2]) * double(v[2]));
+        if (!(a >= min_area) || !std::isfinite(a))
+            continue;
+        const auto p = ds.getPoint(i);
+        // Write unit normals: the copy is reloaded like any other cloud and
+        // has its areas recomputed from whatever neighbours survive.
+        kept.push_back({ double(p[0]), double(p[1]), double(p[2]),
+                         double(v[0]) / a, double(v[1]) / a, double(v[2]) / a });
+    }
+
+    std::ofstream out(filename, std::ios::binary);
+    if (!out)
+        throw std::runtime_error("cannot open " + filename + " for writing");
+    out << "ply\nformat binary_little_endian 1.0\n"
+        << "comment filtered by sfwn_filter_areas: dropped points with "
+        << "voronoi area < " << std::setprecision(17) << min_area << "\n"
+        << "element vertex " << kept.size() << "\n"
+        << "property double x\nproperty double y\nproperty double z\n"
+        << "property double nx\nproperty double ny\nproperty double nz\n"
+        << "end_header\n";
+    for (const auto &row : kept)
+        out.write(reinterpret_cast<const char *>(row.data()),
+                  sizeof(double) * row.size());
+    if (!out)
+        throw std::runtime_error("failed while writing " + filename);
+    return kept.size();
 }
 
 double SfwnField::estimate_majorant(std::size_t direction_count,

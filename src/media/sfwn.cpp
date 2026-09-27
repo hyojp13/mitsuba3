@@ -273,10 +273,11 @@ public:
                                             double(shell_t_scale)));
             m_majorant = m_scale * safety * raw;
             Log(Info,
-                "SFWN majorant: shell-sampled max=%g (%zu points x %zu "
+                "SFWN majorant: shell-sampled max=%g (%zu points probed x %zu "
                 "directions x %zu shell offsets, reach=%g*t), safety=%g "
                 "=> majorant=%g",
-                raw, points, directions, 2 * shell_samples + 1, shell_t_scale,
+                raw, points ? points : m_field->point_count(), directions,
+                2 * shell_samples + 1, shell_t_scale,
                 safety, m_majorant);
         }
         if (!(m_majorant > 0.f) || !std::isfinite(m_majorant))

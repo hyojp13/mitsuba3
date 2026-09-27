@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 NAMESPACE_BEGIN(mitsuba)
 
@@ -97,6 +98,19 @@ public:
      * the peak rather than landing on it and the resulting majorant is
      * exceeded at render time.
      */
+    /// Per-point Voronoi areas, in the field's own order.
+    std::vector<double> point_areas() const;
+
+    /**
+     * Write a PLY holding only the points whose area is at least `min_area`.
+     *
+     * Normals are written as unit vectors, so the copy reloads like any other
+     * cloud and has its areas recomputed from the surviving neighbourhood.
+     * Returns the number of points kept.
+     */
+    std::size_t write_filtered_ply(const std::string &filename,
+                                   double min_area) const;
+
     double estimate_majorant(std::size_t direction_count = 24,
                              std::size_t max_points = 2000,
                              bool use_surfaceness = false,
