@@ -150,6 +150,16 @@ public:
     std::vector<double> point_areas() const;
 
     /**
+     * Positions and unit normals of every point, in octree order.
+     *
+     * getNormal stores unitNormal * voronoiArea, so the stored vector carries
+     * both; this splits them. Points with zero area have no direction and
+     * come back with a zero normal.
+     */
+    void point_frames(std::vector<std::array<double, 3>> &positions,
+                      std::vector<std::array<double, 3>> &normals) const;
+
+    /**
      * Write a PLY holding only the points whose area is at least `min_area`.
      *
      * Normals are written as unit vectors, so the copy reloads like any other

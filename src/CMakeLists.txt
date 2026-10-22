@@ -41,6 +41,10 @@ add_executable(sfwn_gram sfwn/gram.cpp)
 target_link_libraries(sfwn_gram PRIVATE mitsuba)
 set_property(TARGET sfwn_gram PROPERTY CXX_STANDARD 20)
 
+add_executable(sfwn_sheets sfwn/sheets.cpp)
+target_link_libraries(sfwn_sheets PRIVATE mitsuba)
+set_property(TARGET sfwn_sheets PROPERTY CXX_STANDARD 20)
+
 add_executable(sfwn_filter_areas sfwn/filter_areas.cpp)
 target_link_libraries(sfwn_filter_areas PRIVATE mitsuba)
 set_property(TARGET sfwn_filter_areas PROPERTY CXX_STANDARD 20)

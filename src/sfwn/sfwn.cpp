@@ -317,6 +317,25 @@ SfwnVndfSample SfwnField::sample_vndf(
         });
 }
 
+void SfwnField::point_frames(
+    std::vector<std::array<double, 3>> &positions,
+    std::vector<std::array<double, 3>> &normals) const {
+    const auto &ds = m_impl->field->dataset();
+    const auto n = static_cast<std::size_t>(ds.num());
+    positions.resize(n);
+    normals.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto p = ds.getPoint(i);
+        positions[i] = { double(p[0]), double(p[1]), double(p[2]) };
+        // getNormal is unitNormal * voronoiArea; divide the area back out.
+        const auto v = ds.getNormal(i);
+        const double x = double(v[0]), y = double(v[1]), z = double(v[2]);
+        const double len = std::sqrt(x * x + y * y + z * z);
+        normals[i] = len > 0.0 ? std::array<double, 3>{ x / len, y / len, z / len }
+                               : std::array<double, 3>{ 0.0, 0.0, 0.0 };
+    }
+}
+
 std::vector<double> SfwnField::point_areas() const {
     // getNormal stores unitNormal * voronoiArea, so its length is the area.
     const auto &ds = m_impl->field->dataset();
